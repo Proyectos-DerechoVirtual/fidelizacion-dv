@@ -1,0 +1,15 @@
+{
+  "name": "fidelizacion-dv",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "nodemailer": "^6.9.0",
+    "stripe": "^17.0.0"
+  },
+  "devDependencies": {
+    "dotenv": "^17.3.1",
+    "pg": "^8.18.0"
+  }
+}
