@@ -1,7 +1,7 @@
 import { getRecentPurchases } from '../../lib/stripe.js';
 import { findUserByEmail, getUserDetails } from '../../lib/teachable.js';
 import {
-  findPurchaseByChargeId,
+  getExistingChargeIds,
   insertPurchase,
   getPurchasesPendingMessages,
   recordSentMessage,
@@ -15,6 +15,16 @@ import {
 } from '../../lib/email.js';
 import { MESSAGE_TYPES } from '../../lib/constants.js';
 
+// Cache de Teachable por ejecucion (evita llamadas duplicadas al mismo usuario)
+const teachableCache = new Map();
+
+async function getCachedUserDetails(userId) {
+  if (teachableCache.has(userId)) return teachableCache.get(userId);
+  const details = await getUserDetails(userId);
+  teachableCache.set(userId, details);
+  return details;
+}
+
 export default async function handler(req, res) {
   // Verificar clave secreta
   const secret = req.query.key || req.headers['x-cron-secret'];
@@ -25,6 +35,9 @@ export default async function handler(req, res) {
   const dryRun = process.env.DRY_RUN === 'true';
   const maxEmails = parseInt(process.env.MAX_EMAILS_PER_RUN || '20');
   let emailsSent = 0;
+
+  // Limpiar cache al inicio de cada ejecucion
+  teachableCache.clear();
 
   const log = {
     startedAt: new Date().toISOString(),
@@ -39,14 +52,20 @@ export default async function handler(req, res) {
     // FASE 1: Ingestar compras nuevas de Stripe
     // -------------------------------------------------------
     console.log('📦 Obteniendo compras de Stripe...');
-    const stripePurchases = await getRecentPurchases(200); // Ultimos ~200 dias para cubrir msg 4 (6 meses)
+    const stripePurchases = await getRecentPurchases(8); // Ultimos 8 dias (el cron corre cada 30 min)
     console.log(`📦 ${stripePurchases.length} compras encontradas en Stripe`);
 
-    for (const sp of stripePurchases) {
-      try {
-        const existing = await findPurchaseByChargeId(sp.chargeId);
-        if (existing) continue;
+    // Obtener todos los charge IDs ya conocidos en un solo query
+    const stripeChargeIds = stripePurchases.map((sp) => sp.chargeId);
+    const existingIds = stripeChargeIds.length > 0
+      ? await getExistingChargeIds(stripeChargeIds)
+      : new Set();
+    console.log(`📦 ${existingIds.size} ya registradas, ${stripePurchases.length - existingIds.size} nuevas`);
 
+    for (const sp of stripePurchases) {
+      if (existingIds.has(sp.chargeId)) continue;
+
+      try {
         // Buscar en Teachable
         const teachableUser = await findUserByEmail(sp.email);
         let courses = [];
@@ -54,7 +73,7 @@ export default async function handler(req, res) {
 
         if (teachableUser) {
           teachableUserId = String(teachableUser.id);
-          const details = await getUserDetails(teachableUser.id);
+          const details = await getCachedUserDetails(teachableUser.id);
           if (details) {
             // Filtrar cursos enrollados cerca de la fecha de compra (±2 dias)
             const purchaseTime = new Date(sp.date).getTime();
@@ -256,24 +275,20 @@ async function trySendMessage({ purchase, messageType, buildEmailFn, dryRun, log
 
 /**
  * Mensaje 2: solo enviar si el alumno no ha empezado (progreso = 0%)
- * Busca los cursos comprados en esta transaccion y verifica progreso 0.
  */
 async function checkShouldSendActivation(purchase) {
   if (!purchase.teachable_user_id) return false;
 
   try {
-    const details = await getUserDetails(parseInt(purchase.teachable_user_id));
+    const details = await getCachedUserDetails(parseInt(purchase.teachable_user_id));
     if (!details) return false;
 
-    // Filtrar solo los cursos de esta compra
     const purchasedCourseIds = (purchase.courses || []).map((c) => c.course_id);
     const relevantCourses = details.courses.filter((c) =>
       purchasedCourseIds.includes(c.courseId)
     );
 
     if (relevantCourses.length === 0) return false;
-
-    // Verificar que TODOS los cursos comprados tienen progreso 0
     return relevantCourses.every((c) => c.percentComplete === 0);
   } catch {
     return false;
@@ -282,13 +297,12 @@ async function checkShouldSendActivation(purchase) {
 
 /**
  * Mensaje 3: 30+ dias desde compra y progreso bajo (< 10%).
- * NOTA: Teachable API no devuelve last_sign_in_at, usamos percent_complete como proxy.
  */
 async function checkShouldSendReactivation(purchase) {
   if (!purchase.teachable_user_id) return false;
 
   try {
-    const details = await getUserDetails(parseInt(purchase.teachable_user_id));
+    const details = await getCachedUserDetails(parseInt(purchase.teachable_user_id));
     if (!details) return false;
 
     const purchasedCourseIds = (purchase.courses || []).map((c) => c.course_id);
@@ -297,8 +311,6 @@ async function checkShouldSendReactivation(purchase) {
     );
 
     if (relevantCourses.length === 0) return false;
-
-    // Progreso bajo en todos los cursos comprados (< 10%)
     return relevantCourses.every((c) => c.percentComplete < 10);
   } catch {
     return false;
@@ -307,13 +319,12 @@ async function checkShouldSendReactivation(purchase) {
 
 /**
  * Mensaje 4: 6+ meses desde compra y progreso bajo (< 15%).
- * NOTA: Teachable API no devuelve last_sign_in_at, usamos percent_complete como proxy.
  */
 async function checkShouldSendRecovery(purchase) {
   if (!purchase.teachable_user_id) return false;
 
   try {
-    const details = await getUserDetails(parseInt(purchase.teachable_user_id));
+    const details = await getCachedUserDetails(parseInt(purchase.teachable_user_id));
     if (!details) return false;
 
     const purchasedCourseIds = (purchase.courses || []).map((c) => c.course_id);
@@ -322,8 +333,6 @@ async function checkShouldSendRecovery(purchase) {
     );
 
     if (relevantCourses.length === 0) return false;
-
-    // Progreso bajo en los cursos comprados (< 15%)
     return relevantCourses.every((c) => c.percentComplete < 15);
   } catch {
     return false;
